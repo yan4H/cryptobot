@@ -75,6 +75,7 @@ class ProveBacktesting:
     def __init__(self, cfg: Dict[str, Any]) -> None:
         """init"""
         self.min: float = float(cfg["MIN"])
+        self.max: float = float(cfg["MAX"])
         self.filter_by: str = cfg["FILTER_BY"]
         self.from_date: datetime = datetime.strptime(
             str(cfg["FROM_DATE"]), "%Y%m%d"
@@ -595,7 +596,7 @@ class ProveBacktesting:
         if not self.filter_by in cfgname:
             return (False, {})
         profit: float = float(_profit)
-        if profit < 0 or profit < float(self.min):
+        if profit < 0 or profit < float(self.min) or profit > float(self.max):
             return (False, {})
 
         coin: str = cfgname[9:].split(".")[0]
