@@ -16,7 +16,7 @@ import requests
 from requests import Timeout
 import udatetime
 import yaml
-import ccxt
+import ccxt 
 
 from binance.exceptions import BinanceAPIException
 from pyrate_limiter import Duration, Limiter, RequestRate
