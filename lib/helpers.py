@@ -7,9 +7,10 @@ from datetime import datetime
 from functools import lru_cache
 from os.path import exists, getctime
 from time import sleep, time
+import ccxt
+from ccxt import kucoin
 
 import udatetime
-from binance.client import Client
 from filelock import SoftFileLock
 from tenacity import retry, wait_fixed, stop_after_delay
 
@@ -45,27 +46,30 @@ def c_from_timestamp(date: float) -> datetime:
 
 
 @retry(wait=wait_fixed(2), stop=stop_after_delay(10))
-def cached_binance_client(access_key: str, secret_key: str) -> Client:
-    """retry wrapper for binance client first call"""
+def cached_kucoin_client(api_key: str, secret_key: str) -> kucoin:
+    """retry wrapper for kucoin client first call"""
 
-    lock = SoftFileLock("state/binance.client.lockfile", timeout=10)
+    lock = SoftFileLock("state/kucoin.client.lockfile", timeout=10)
     # when running automated-testing with multiple threads, we will hit
     # api requests limits, this happens during the client initialization
     # which mostly issues a ping. To avoid this when running multiple processes
     # we cache the client in a pickled state on disk and load it if it already
     # exists.
-    cachefile = "cache/binance.client"
+    cachefile = "cache/kucoin.client"
     with lock:
         if exists(cachefile) and (
             udatetime.now().timestamp() - getctime(cachefile) < (30 * 60)
         ):
-            logging.debug("re-using local cached binance.client file")
+            logging.debug("re-using local cached kucoin.client file")
             with open(cachefile, "rb") as f:
                 _client = pickle.load(f)  # nosec
         else:
             try:
-                logging.debug("refreshing cached binance.client")
-                _client = Client(access_key, secret_key)
+                logging.debug("refreshing cached kucoin.client")
+                _client = kucoin({
+                    "apiKey": api_key,
+                    "secret": secret_key
+                })
             except Exception as err:
                 logging.warning(f"API client exception: {err}")
                 if "much request weight used" in str(err):
