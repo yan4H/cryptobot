@@ -1,4 +1,5 @@
 """ load_klines_for_coin: manages the cache/ directory """
+import hashlib
 import json
 import logging
 import sys
@@ -9,6 +10,8 @@ from hashlib import md5
 from os import getpid, mkdir
 from os.path import exists
 from time import sleep
+import ccxt
+
 
 import colorlog  # pylint: disable=E0401
 import requests
@@ -75,26 +78,22 @@ def c_from_timestamp(date: float) -> datetime:
 
 
 @retry(wait=wait_exponential(multiplier=1, max=3))
-@limiter.ratelimit("binance", delay=True)
-def requests_with_backoff(query: str):
-    """retry wrapper for requests calls"""
-    response = requests.get(query, timeout=30)
+@limiter.ratelimit("kucoin", delay=True)
+def requests_with_backoff(exchange, query: str):
+    """retry wrapper for ccxt calls"""
 
-    # 418 is a binance api limits response
-    # don't raise a HTTPError Exception straight away but block until we are
-    # free from the ban.
-    status = response.status_code
-    if status in [418, 429]:
-        backoff = int(response.headers["Retry-After"])
-        logging.warning(f"HTTP {status} from binance, sleeping for {backoff}s")
-        sleep(backoff)
-        response.raise_for_status()
-    return response
-
+    while True:
+        try:
+            response = exchange.fetch_ohlcv(query)
+            return response
+        except (ccxt.RequestTimeout, ccxt.DDoSProtection) as e:
+            backoff = int(e.seconds)
+            logging.warning(f"HTTP {e.status} from kucoin, sleeping for {backoff}s")
+            sleep(backoff)
 
 def process_klines_line(kline):
     """returns date, low, avg, high from a kline"""
-    (_, _, high, low, _, _, closetime, _, _, _, _, _) = kline
+    (closetime, _, high, low, _, _) = kline
 
     date = float(c_from_timestamp(closetime / 1000).timestamp())
     low = float(low)
@@ -127,16 +126,10 @@ def read_from_local_cache(f_path, symbol):
         try:
             # pylint: disable=W0612
             (
-                _,
+                closetime,
                 _,
                 high,
                 low,
-                _,
-                _,
-                closetime,
-                _,
-                _,
-                _,
                 _,
                 _,
             ) = results[0]
@@ -193,22 +186,24 @@ def populate_values(klines, unit):
 
     return (True, values)
 
-
-def call_binance_for_klines(query):
-    """calls upstream binance and retrieves the klines for a coin"""
-    logging.info(f"calling binance on {query}")
+def call_kucoin_for_klines(query):
+    """calls upstream kucoin and retrieves the klines for a coin"""
+    logging.info(f"calling kucoin on {query}")
+    
     with LOCK:
         response = requests_with_backoff(query)
-    if response.status_code == 400:
-        # 400 typically means binance has no klines for this coin
-        logging.warning(f"got a 400 from binance for {query}")
+        
+    if not response:
+        # Empty response typically means kucoin has no klines for this coin
+        logging.warning(f"got an empty response from kucoin for {query}")
         return (True, [])
+    
     return (True, response.json())
 
 
-def save_binance_klines(query, f_path, klines, mode, symbol):
-    """saves binance klines for a coin locally"""
-    logging.info(f"caching binance {query} on cache/{symbol}/{f_path}")
+def save_kucoin_klines(query, f_path, klines, mode, symbol):
+    """saves kucoin klines for a coin locally"""
+    logging.info(f"caching kucoin {query} on cache/{symbol}/{f_path}")
     if mode == "backtesting":
         if not exists(f"cache/{symbol}"):
             mkdir(f"cache/{symbol}")
@@ -216,43 +211,51 @@ def save_binance_klines(query, f_path, klines, mode, symbol):
         with open(f"cache/{symbol}/{f_path}", "w") as f:
             f.write(json.dumps(klines))
 
-
 @app.route("/")
 def load_klines_for_coin():
-    """fetches from binance or a local cache klines for a coin"""
+    """fetches from kucoin or a local cache klines for a coin"""
 
     symbol = request.args.get("symbol")
     date = int(float(request.args.get("date")))
     mode = request.args.get("mode")
 
-    # when we initialise a coin, we pull a bunch of klines from binance
+    # Instantiate kucoin exchange class with rate limit options
+    kucoin = ccxt.kucoin({
+        'apiKey': 'YOUR_API_KEY',
+        'secret': 'YOUR_SECRET',
+        'enableRateLimit': True, # enable built-in rate limiter
+        'rateLimit': 1000, # set delay between requests in milliseconds
+    })
+
+
+    # when we initialize a coin, we pull a bunch of klines from kucoin
     # for that coin and save it to disk, so that if we need to fetch the
     # exact same data, we can pull it from disk instead.
-    # we pull klines for the last 60min, the last 24h, and the last 1000days
-
-    api_url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&"
-
+    
     unit_values = {
-        "m": (60, 1),
-        "h": (24, 60),
-        # for 'Days' we retrieve 1000 days, binance API default
-        "d": (1000, 60 * 24),
+        "m": (60 * 1000),
+        "h": (60 * 60 * 1000),
+        "d": (24 * 60 * 60 * 1000)
     }
+    
     unit_url_fpath = []
     for unit in ["m", "h", "d"]:
-        # lets find out the from what date we need to pull klines from while in
-        # backtesting mode.
-        timeslice, minutes_before_now = unit_values[unit]
+        minutes_before_now = unit_values[unit]
+         
+        backtest_end_time_ms = date - minutes_before_now
+         
+        query_params ={
+            'symbol': symbol,
+            'endTime': backtest_end_time_ms,
+            'interval': f'1{unit}'
+        }
 
-        backtest_end_time = date
-        end_unix_time = int(
-            (backtest_end_time - (60 * minutes_before_now)) * 1000
-        )
-
-        query = f"{api_url}endTime={end_unix_time}&interval=1{unit}"
-        md5_query = md5(query.encode()).hexdigest()  # nosec
-        f_path = f"{symbol}.{md5_query}"
-        unit_url_fpath.append((unit, query, f_path))
+        response_data= requests_with_backoff(kucoin,query_params)
+         
+        md5_query= hashlib.md5(repr(query_params).encode()).hexdigest()
+        file_path=f"{symbol}.{md5_query}"
+          
+        unit_url_fpath.append((unit,response_data,file_path))
 
     values = {}
     for metric in ["lowest", "averages", "highest"]:
@@ -264,9 +267,9 @@ def load_klines_for_coin():
         klines = []
         ok, klines = read_from_local_cache(f_path, symbol)
         if not ok:
-            ok, klines = call_binance_for_klines(query)
+            ok, klines = call_kucoin_for_klines(query)
             if ok:
-                save_binance_klines(query, f_path, klines, mode, symbol)
+                save_kucoin_klines(query, f_path, klines, mode, symbol)
 
         if ok:
             ok, low_avg_high = populate_values(klines, unit)
@@ -282,4 +285,4 @@ def load_klines_for_coin():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8999)
+    app.run(host="0.0.0.0", port=8996)
